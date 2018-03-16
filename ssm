@@ -1,0 +1,335 @@
+#!/usr/bin/env python
+"""Arbitrary SSM capability.
+
+Dispatch arbitrary commands to instances via AWS EC2 Run Command (AKA SSM; see
+http://docs.aws.amazon.com/systems-manager/latest/userguide/execute-remote-commands.html).
+
+Usage:
+  ssm [-vqh] single --instance=INSTANCEID [--account=ACCOUNT] [--incident=INCIDENT] -- COMMAND...
+  ssm [-vqh] multi --app=APP [--account=ACCOUNT] [--incident=INCIDENT] -- COMMAND...
+
+Arguments:
+  COMMAND   Command(s) to run on remote instance(s). Will be run as root.
+
+Options:
+  -a, --app=APP                 An application name, as recognized by internal tool. See
+                                ${INTERNALTOOL} for a list.
+  -i, --instance=INSTANCEID     When executing a command against a single instance using 'ssm
+                                single', specify the AWS EC2 Instance ID using this option.
+  -n, --account=ACCOUNT         The account in which the application runs. One of: 'prod', 'test'.
+                                [default: test]
+  -d, --incident=INCIDENT       An optional incident identifier, e.g. 'SEC-615',
+                                or comment. [default: ${INTERNALTEAM}-investigative-activity]
+  -h --help                     This help.
+  -v                            Verbose output.
+  -q                            Quieter output.
+
+"""
+
+import boto3
+import logging
+import requests
+import utils
+from account import Account
+from app import App
+from base64 import urlsafe_b64encode
+from botocore.exceptions import ClientError
+from docopt import docopt
+from docopt import DocoptExit
+from halo import Halo
+from time import sleep
+
+# Your internal locator
+LOCATE_URL = 'http://INTERNALTOOL/api/v1/locate/{query}'
+
+# Dots to provide "time elapsed" feedback to the user.
+SPINNER = 'dots2'
+
+
+class InstanceNotFound(Exception):
+    """An Amazon AWS EC2 instance was not found."""
+
+    def __init__(self):
+        """Instance not found."""
+        Exception.__init__(self, "Instance not found in location service.")
+
+
+@Halo(text='Determining instance region...', spinner=SPINNER)
+def get_region(instance):
+    """Use Locate service to obtain region details about a resource.
+
+    :resource: String. An instance ID.
+    :returns: String. Region where the instance is located.
+
+    """
+    result = requests.get(LOCATE_URL.format(query=str(instance)))
+    if not result.json():
+        raise InstanceNotFound
+    region = result.json()[0]['attrs']['region']
+    logger.debug("Region found is \"{region}\".".format(region=region))
+    return region
+
+
+@Halo(text='Assuming role...', spinner=SPINNER)
+def assume_role(accountnumber, incident, role='Investigate'):
+    """Use AWS's Security Token Service to assume into a role.
+
+    :accountnumber: String. An AWS account number to use.
+    :role: String. An AWS role name to assume.
+    :incident: String. A unique identifier (such as 'FUN-123'), or comment.
+    :returns: Dict. A set of temporary AWS credentials that can be used to make AWS requests.
+
+    """
+    arn = 'arn:aws:iam::{accountnumber}:role/{role}'.format(
+        accountnumber=accountnumber,
+        role=role,
+    )
+    role_session_name = incident
+    logger.debug("Attempting assume role to ARN \'{0}\'.".format(arn))
+    stsclient = boto3.client('sts')
+    assumedrole = stsclient.assume_role(
+        RoleArn=arn,
+        RoleSessionName=role_session_name,
+    )
+    return assumedrole
+
+
+@Halo(text='Obtaining SSM client...', spinner=SPINNER)
+def get_client(role, region):
+    """Obtain an SSM client object.
+
+    :role: Dict. Temporary credentials.
+    :returns: Object. Boto3 client.
+    """
+    logger.debug("Building an SSM client in {region}.".format(region=region))
+    client = boto3.client(
+        'ssm',
+        region_name=region,
+        aws_access_key_id=role['Credentials']['AccessKeyId'],
+        aws_secret_access_key=role['Credentials']['SecretAccessKey'],
+        aws_session_token=role['Credentials']['SessionToken'],
+    )
+    return client
+
+
+def encode_command(string):
+    """Base64-encode and prepare an SSM command string, to avoid shell interpolation.
+
+    :string: String. A command or commands to be encoded.
+    :returns: String. Command(s) prepared for execution.
+
+    """
+    encoded = urlsafe_b64encode(string)
+    command = "eval $(echo {encoded} | base64 --decode)".format(encoded=encoded)
+    return command
+
+
+@Halo(text='Sending command...', spinner=SPINNER)
+def send_command(client, instances, incident, command):
+    """Send SSM command to target instances.
+
+    :client: Object. AWS SSM client.
+    :instances: List. Instances to affect.
+    :incident: String. An incident identfier or comment.
+    :command: String. Command to send to instance.
+    :returns: String. GUID uniquely identifying the SSM command.
+    """
+    logger.debug("Sending command(s) to instance(s).")
+    try:
+        response = client.send_command(
+            InstanceIds=[
+                # boto3 limits us to 50 IDs
+                # http://boto3.readthedocs.io/en/latest/reference/services/ssm.html?highlight=ssm#SSM.Client.send_command
+                instances,
+            ],
+            DocumentName='AWS-RunShellScript',
+            Comment=incident,
+            Parameters={
+                'commands': command
+            },
+        )
+    except ClientError as ex:
+        if ex.response['Error']['Code'] == 'InvalidInstanceId':
+            logger.error("AWS doesn't have a record of this instance (got {}).".format(
+                ex.response['Error']['Code']))
+        raise
+    command_id = response['Command']['CommandId']
+    logger.debug("Full response was:\n" + str(response))
+    logger.debug("Returning command_id {}".format(command_id))
+    # command_id = '123412341234123412341234123412341234'
+    return command_id
+
+
+def process(items):
+    """Dispatch an SSM command to each instance in a list.
+
+    :items: list
+    :returns: string
+
+    """
+    # Given a list of instances, take each instance in turn, and send the
+    # commands in parallel. Poll to determine the command result (any result,
+    # success or failure). Note the result.
+    # while items:
+    #     instance = items.pop()
+    #     logger.debug("Sending command to {}".format(instance))
+    #     # TODO: Insert command dispatch logic here
+    #     # Return success or failure message or code for each
+    #     single_result = poll_until_single_result(command_id)
+    #     logger.debug("Result for {} was: {}".format(instance, result))
+    #     all_results['command_id'] = [instance, single_result]
+    # logger.debug("Processed instance group.")
+    # return
+    pass
+
+
+def poll(client, command_id, instance_id):
+    """Query the SSM endpoint to determine whether a command has completed.
+
+    :client: Object. Boto3-style SSM client object.
+    :command_id: String. GUID for SSM command.
+    :returns: Boolean.
+
+    """
+    logger.debug("Getting command status for " + command_id +
+                 " run on instance " + instance_id)
+    try:
+        result = client.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=instance_id,
+        )
+        status = result['Status']
+        if status not in ['Success', 'TimedOut', 'Cancelled', 'Failed']:
+            return False
+        else:
+            return True
+    except ClientError as ex:
+        if ex.response['Error']['Code'] == 'InvocationDoesNotExist':
+            logger.warning("AWS reports command not yet created: {}.".format(
+                ex.response['Error']['Code']))
+        return False
+
+
+def get_command_result(client, command_id, instance_id):
+    """Get result of SSM command."""
+    logger.debug("Getting command result for " + command_id +
+                 " run on instance " + instance_id)
+    #  TODO: Handle possible botocore.errorfactory.InvocationDoesNotExist
+    logger.debug("Waiting for invocation to exist...")
+    sleep(2)
+
+    return client.get_command_invocation(
+        CommandId=command_id,
+        InstanceId=instance_id,
+    )
+
+
+@Halo(text='Polling until command completion...', spinner=SPINNER)
+def poll_until_complete(client, command_id, instance_id):
+    """Continue polling the SSM endpoint until a success or failure result is obtained.
+
+    :command_id: TODO
+    :returns: TODO
+
+    """
+    nums_iter = utils.gen_nums()
+    while not poll(client, command_id, instance_id):
+        try:
+            backoff = nums_iter.next()
+            logger.debug("Waiting {} for next poll of completion status.".format(
+                str(backoff)))
+            sleep(backoff)
+        except StopIteration:
+            raise Exception("Client error: reached polling timeout "
+                            "of {} seconds.".format(backoff))
+    result = get_command_result(client, command_id, instance_id)
+    return result
+
+
+def main(args):
+    """Direct all execution."""
+    account = Account(args['--account'])
+    incident = args['--incident']
+    command = args['COMMAND'][0]  # Single-item list of commands
+    if args['single']:
+        instance = args['--instance']
+        region = get_region(instance)
+        role = assume_role(account.number, incident)
+        client = get_client(role, region)
+        encoded_command = [encode_command(command)]
+        command_id = send_command(client, instance, incident, encoded_command)
+        result = poll_until_complete(client, command_id, instance)
+        logger.debug("Got {}.".format(result))
+        stdout = result['StandardOutputContent']
+        print("Result for \"{command}\" on [{instance}] in [{region}]: \n{stdout}".format(
+            command=command,
+            instance=instance,
+            region=region,
+            stdout=stdout,)
+        )
+    elif args['multi']:
+        logger.debug("Instantiating an App named \"{}\" in account \"{}\".".format(
+            args['--app'], account.name)
+        )
+        app = App(args['--app'], account)
+        role = assume_role(account.number, incident)
+
+        for asg, instances in app.instances_by_region.items():
+            client = get_client(role, region)
+            encoded_command = [encode_command(command)]
+            # TODO: send command
+            # Boto allows us to submit only fifty instances at a time.
+            while instances:
+                if len(instances) > 50:
+                    shortlist = [instances.pop() for i in range(50)]
+                    process(shortlist)
+                    command_id = send_command(client, instance, incident, encoded_command)
+                    result = poll_until_complete(client, command_id, instance)
+                    logger.debug("Got {}.".format(result))
+                    stdout = result['StandardOutputContent']
+                    print("Result for \"{command}\" on [{instance}] in [{region}]: \n{stdout}".format(
+                        command=command,
+                        instance=instance,
+                        region=region,
+                        stdout=stdout,)
+                    )
+                else:
+                    count = range(len(instances))
+                    shortlist = [instances.pop() for i in count]
+                    process(shortlist)
+    else:
+        pass
+        # send_command(instances, command)
+        # If there are more than fifty instances:
+        #     Take the first fifty, create a list of those, and send them to the SSM
+        #     command.
+        #     Then wait until the API endpoint has acknowledged their presence.
+        #           If an instance fails to respond, note that in a list of all the
+        #           responses.
+        #     When the API endpoint has acknowledged the receipt of those first fifty
+        #     commands:
+        #         Send the next fifty.
+        #         Repeat this until commands have been sent to all instances.
+        # If there are fifty or fewer instances:
+        #     send those to the SSM send command.
+        # The SSM send command accepts a list of instances, and a command to send to
+        # them.
+        # When finished, print out a list of all the instances and the response saved
+        # from each.
+
+
+if __name__ == "__main__":
+    try:
+        args = docopt(__doc__)
+    except DocoptExit:
+        print(__doc__)
+    else:
+        if args['-q']:
+            logging.basicConfig(level='CRITICAL')
+        elif args['-v']:
+            logging.basicConfig(level='DEBUG')
+        else:
+            logging.basicConfig(level='WARNING')
+        logger = logging.getLogger(__name__)
+        logger.debug("Args ####### {}.".format(args))
+        main(args)
